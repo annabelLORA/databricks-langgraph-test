@@ -135,18 +135,8 @@ class ProcessManager:
             print(f"Error monitoring {name}: {e}")
             self.failed.set()
 
-    # Model definitions kept in sync with agent_server/agent.py
-    AVAILABLE_MODELS = [
-        {"endpoint": "databricks-claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
-        {"endpoint": "databricks-claude-opus-4-6",   "label": "Claude Opus 4.6"},
-        {"endpoint": "databricks-claude-sonnet-4-5", "label": "Claude Sonnet 4.5"},
-        {"endpoint": "databricks-claude-haiku-4-5",  "label": "Claude Haiku 4.5"},
-        {"endpoint": "databricks-gpt-oss-120b",      "label": "GPT OSS 120B"},
-        {"endpoint": "databricks-gpt-oss-20b",       "label": "GPT OSS 20B"},
-        {"endpoint": "databricks-gemma-3-12b",       "label": "Gemma 3 12B"},
-        {"endpoint": "poc-lor-classifier",           "label": "Llama 3.3 70B Instruct"},
-    ]
-    DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
+    # Imported from the single source of truth in agent_server/models.py
+    from agent_server.models import AVAILABLE_MODELS, DEFAULT_MODEL
 
     def patch_frontend(self, frontend_dir: Path):
         """Inject model selector component and wire it into the chat API calls."""
@@ -310,6 +300,63 @@ export default function ModelSelector({{ value, onChange }}: Props) {{
             break
 
         print("Frontend model selector patch applied.")
+
+        # ------------------------------------------------------------------
+        # 4. Patch next.config to proxy /download/* to the backend so the
+        #    browser's native download works via a relative link.
+        # ------------------------------------------------------------------
+        self._patch_next_config_rewrites(frontend_dir)
+
+    def _patch_next_config_rewrites(self, frontend_dir: Path):
+        backend_url = f"http://localhost:{self.port}"
+        rewrite_snippet = f"""
+  async rewrites() {{
+    return [
+      {{
+        source: '/download/:token',
+        destination: '{backend_url}/download/:token',
+      }},
+    ];
+  }},"""
+
+        for config_name in ("next.config.mjs", "next.config.js", "next.config.ts"):
+            config_path = frontend_dir / config_name
+            if not config_path.exists():
+                continue
+            text = config_path.read_text(errors="replace")
+            if "/download/" in text:
+                # Already patched
+                break
+            # Insert rewrites before the closing of the config object/export
+            import re as _re
+            # Match the last closing brace of the config export
+            new_text = _re.sub(
+                r'(const\s+nextConfig\s*=\s*\{)',
+                r'\1' + rewrite_snippet,
+                text,
+                count=1,
+            )
+            if new_text == text:
+                # Fallback: try module.exports pattern
+                new_text = _re.sub(
+                    r'(module\.exports\s*=\s*\{)',
+                    r'\1' + rewrite_snippet,
+                    text,
+                    count=1,
+                )
+            if new_text != text:
+                config_path.write_text(new_text)
+                print(f"  Patched Next.js rewrites in {config_name}")
+            break
+        else:
+            # No config found — create a minimal one
+            config_path = frontend_dir / "next.config.js"
+            config_path.write_text(
+                f"/** @type {{import('next').NextConfig}} */\n"
+                f"const nextConfig = {{\n{rewrite_snippet}\n}};\n\n"
+                f"module.exports = nextConfig;\n"
+            )
+            print("  Created next.config.js with download rewrite")
 
     def clone_frontend_if_needed(self):
         if Path("e2e-chatbot-app-next").exists():
