@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 from datetime import datetime
@@ -17,8 +16,10 @@ from mlflow.types.responses import (
     to_chat_completions_input,
 )
 
+from agent_server.file_store import store_file
 from agent_server.hse_planner import build_risk_plan, write_excel
 from agent_server.knowledge import get_activities_in_window
+from agent_server.models import AVAILABLE_MODELS, DEFAULT_MODEL
 from agent_server.utils import (
     get_session_id,
     process_agent_astream_events,
@@ -27,17 +28,6 @@ from agent_server.utils import (
 logger = logging.getLogger(__name__)
 mlflow.langchain.autolog()
 
-AVAILABLE_MODELS = [
-    {"endpoint": "databricks-claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
-    {"endpoint": "databricks-claude-opus-4-6",   "label": "Claude Opus 4.6"},
-    {"endpoint": "databricks-claude-sonnet-4-5", "label": "Claude Sonnet 4.5"},
-    {"endpoint": "databricks-claude-haiku-4-5",  "label": "Claude Haiku 4.5"},
-    {"endpoint": "databricks-gpt-oss-120b",      "label": "GPT OSS 120B"},
-    {"endpoint": "databricks-gpt-oss-20b",       "label": "GPT OSS 20B"},
-    {"endpoint": "databricks-gemma-3-12b",       "label": "Gemma 3 12B"},
-    {"endpoint": "poc-lor-classifier",           "label": "Llama 3.3 70B Instruct"},
-]
-DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
 _VALID_ENDPOINTS = {m["endpoint"] for m in AVAILABLE_MODELS}
 logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
 sp_workspace_client = WorkspaceClient()
@@ -70,8 +60,16 @@ Once you have those, call `generate_hse_risk_plan`. The tool will:
 - Populate and return the base template workbook as a downloadable Excel file
 
 After the tool responds, present:
-1. A brief executive narrative: Horizon → Risk Cluster → key mitigation
-2. Instructions for the user to save the Excel file (decode base64 or use the download link)
+1. An executive summary using nested bullets — one block per horizon, each risk cluster as a sub-bullet with its single key mitigation:
+   - **30-Day Horizon**
+     - *Risk Category*: Key mitigation
+     - ...
+   - **60-Day Horizon**
+     - ...
+   - **90-Day Horizon**
+     - ...
+2. A download link on its own line using the download_token from the tool response:
+   [📥 Download Risk Plan](/download/{download_token})
 
 Never fabricate risk details, categories, or controls — everything comes from the project data.
 """
@@ -136,10 +134,10 @@ def generate_hse_risk_plan(
 
     start_month_year = plan_start.strftime("%B %Y")
     excel_bytes = write_excel(project_name, work_pack, start_month_year, rows)
-    b64 = base64.b64encode(excel_bytes).decode("utf-8")
 
     date_str = plan_start.strftime("%d_%m_%Y")
     filename = f"{date_str} - 30-60-90 - {work_pack} - {start_month_year}.xlsx"
+    download_token = store_file(excel_bytes, filename)
 
     # Build summary per horizon
     from collections import Counter
@@ -159,16 +157,10 @@ def generate_hse_risk_plan(
 
     return json.dumps({
         "filename": filename,
-        "content_base64": b64,
+        "download_token": download_token,
         "total_rows": len(rows),
         "activity_count": len(combined),
         "summary": summary,
-        "message": (
-            f"Risk plan generated: {len(rows)} control rows across {len(combined)} activities. "
-            f"Filename: {filename}. "
-            "To save in Python: "
-            "import base64; open('risk_plan.xlsx','wb').write(base64.b64decode(result['content_base64']))"
-        ),
     })
 
 
@@ -245,7 +237,7 @@ async def init_agent(model_endpoint: str = DEFAULT_MODEL, workspace_client=None)
     tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan]
     return create_agent(
         tools=tools,
-        model=ChatDatabricks(endpoint=endpoint),
+        model=ChatDatabricks(endpoint=endpoint, temperature=0.2, top_p=0.5),
         system_prompt=SYSTEM_PROMPT,
     )
 
