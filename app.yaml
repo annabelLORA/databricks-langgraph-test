@@ -1,5 +1,4 @@
-command: ["uv", "run", "start-app"]
-# databricks apps listen by default on port 8000
+command: ["bash", "-c", "cd agent-langgraph && uv run start-app"]
 
 env:
   - name: MLFLOW_TRACKING_URI
