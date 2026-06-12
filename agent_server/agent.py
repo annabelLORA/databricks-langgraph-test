@@ -290,14 +290,26 @@ def get_current_time() -> str:
 
 # ── Agent initialisation ──────────────────────────────────────────────────────
 
+_agent_cache: dict[str, object] = {}
+
+
 async def init_agent(model_endpoint: str = DEFAULT_MODEL, workspace_client=None):
     endpoint = model_endpoint if model_endpoint in _VALID_ENDPOINTS else DEFAULT_MODEL
+    if endpoint in _agent_cache:
+        return _agent_cache[endpoint]
     tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan, query_playbook_processes]
-    return create_agent(
+    agent = create_agent(
         tools=tools,
-        model=ChatDatabricks(endpoint=endpoint, temperature=0.2, top_p=0.5),
+        model=ChatDatabricks(
+            endpoint=endpoint,
+            temperature=0.2,
+            top_p=0.5,
+            model_kwargs={"extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"}},
+        ),
         system_prompt=SYSTEM_PROMPT,
     )
+    _agent_cache[endpoint] = agent
+    return agent
 
 
 @invoke()

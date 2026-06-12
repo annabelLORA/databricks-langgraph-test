@@ -32,18 +32,37 @@ from agent_server import agent  # noqa: F401
 # Defining custom scorers: https://docs.databricks.com/aws/en/mlflow3/genai/eval-monitor/custom-scorers
 test_cases = [
     {
-        "goal": "Learn about the main dishes of Vietnamese cuisine",
-        "persona": "An impatient foodie who doesn't know much about Vietnamese cuisine.",
+        "goal": "Generate a 30/60/90-day HSE risk plan for concrete deck pours scheduled next month.",
+        "persona": "A site HSE manager on a bridge construction project who needs a risk plan for upcoming concrete works.",
         "simulation_guidelines": [
-            "Initially explore the main influences of Vietnamese cuisine before the main dishes.",
+            "Start by asking what activities are coming up in the schedule before requesting the full plan.",
+            "Provide the project name 'Pacific Highway Upgrade', start date '01/07/2026', work pack 'Bridge Deck Concrete Works', and person responsible 'Site HSE Manager' when prompted.",
+            "Ask a follow-up about what the Top 5 risks are for the 30-day horizon.",
         ],
     },
     {
-        "goal": "Figure out which prime numbers between 1 and 50 are also Fibonacci numbers",
-        "persona": "You are a math novice who has heard of prime numbers but doesn't know what Fibonacci numbers are.",
+        "goal": "Find out what processes a Planning & Project Controls manager should own during the Construction phase.",
+        "persona": "A newly appointed PTL (Project Team Lead) responsible for Planning & Project Controls who wants to understand their role in the Construction phase.",
         "simulation_guidelines": [
-            "Initially ask questions to understand the Fibonacci sequence before exploring which ones are prime.",
-            "Prefer short messages",
+            "Initially ask broadly about what to focus on, before providing the specific role and phase.",
+            "Provide your role as 'Planning & Project Controls' and phase as 'Construction' when asked.",
+            "Ask a follow-up about which checkpoints are needed to unlock the Completion phase.",
+        ],
+    },
+    {
+        "goal": "Understand what HSE controls apply to crane lifts adjacent to a waterway.",
+        "persona": "A rigger supervisor who is planning a crane lift to install bridge girders over a river and wants to know the applicable HSE controls.",
+        "simulation_guidelines": [
+            "Ask about applicable FSR controls first, then ask about environmental (SER) controls.",
+            "Ask specifically about what makes a lift a Top 5 risk.",
+        ],
+    },
+    {
+        "goal": "Check what scheduled activities are coming up in the next 30 days that involve scaffolding.",
+        "persona": "A construction supervisor who wants to see the upcoming scaffolding programme.",
+        "simulation_guidelines": [
+            "Ask to preview the schedule with a scaffold filter before requesting any full plan.",
+            "Follow up by asking which activities carry the highest risk classification.",
         ],
     },
 ]
