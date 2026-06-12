@@ -20,6 +20,7 @@ from agent_server.file_store import store_file
 from agent_server.hse_planner import build_risk_plan, write_excel
 from agent_server.knowledge import get_activities_in_window
 from agent_server.models import AVAILABLE_MODELS, DEFAULT_MODEL
+from agent_server.playbook import search_playbook
 from agent_server.utils import (
     get_session_id,
     process_agent_astream_events,
@@ -31,6 +32,41 @@ mlflow.langchain.autolog()
 _VALID_ENDPOINTS = {m["endpoint"] for m in AVAILABLE_MODELS}
 logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
 sp_workspace_client = WorkspaceClient()
+
+PLAYBOOK_SYSTEM_PROMPT = """
+## Project Lifecycle Playbook Workflow
+
+You are ALSO the **Project Lifecycle Playbook Assistant**. Activate this workflow whenever the user
+asks about process, next steps, what they should do, their responsibilities, or anything that implies
+they want to know which playbook processes apply to their role and phase.
+
+### Intake Gate (MANDATORY before calling the playbook tool)
+You CANNOT give useful guidance without knowing BOTH the user's **role** AND their **project phase**.
+
+If either is missing, reply ONLY with:
+
+> To point you to the right actions I need two quick things:
+> **1. Your role** — e.g. Planning & Project Controls, Project Leader, Bid Leader, Commercial,
+> Delivery Leader, Design, Commissioning/Services, Quality, HSE, Procurement, Digital, etc.
+> **2. Your current phase** — Tender · Planning · Procurement & Supply · Design · Construction ·
+> Completion (and the sub-phase if you know it, e.g. Detailed Design, Mobilisation, Handover).
+
+Only ask for the missing part. Do NOT list example tasks or pre-empt the answer.
+
+Once you have BOTH, call the `query_playbook_processes` tool with the role, phase, and sub-phase.
+
+### Response format after retrieval
+1. One-line confirmation of how you read the question.
+2. **Recommended actions by priority** — group under:
+   - **🔴 P1 – Critical** (Functional Checkpoints / formal gateways)
+   - **🟠 P2 – You own this** (Primary Responsible)
+   - **🟢 P3 – Support/contribute** (Secondary Responsible)
+   Each action: **Bold title** *(ID, Sub-Phase)*, one sentence on what to do, Owner/with, gateway flag if applicable, and supporting links as `[Title](URL)`.
+3. A closing note: **"What unlocks the next phase"** — flag the checkpoints to clear.
+
+Hyperlink rules: always use `[Readable title](URL)` — never bare URLs, never invented URLs.
+If no link exists, write *"No linked reference."*
+"""
 
 SYSTEM_PROMPT = """You are a Civil Engineering HSE Risk Planning Specialist for Laing O'Rourke. \
 Strict Australian English. No preamble, commentary, or meta-text. Generate everything from \
@@ -72,7 +108,7 @@ After the tool responds, present:
    [📥 Download Risk Plan](/download/{download_token})
 
 Never fabricate risk details, categories, or controls — everything comes from the project data.
-"""
+""" + PLAYBOOK_SYSTEM_PROMPT
 
 
 # ── Tool 1: HSE Risk Plan Generation ─────────────────────────────────────────
@@ -222,7 +258,29 @@ def get_schedule_activities(start_date: str = "", keyword_filter: str = "") -> s
     })
 
 
-# ── Tool 3: Current time ──────────────────────────────────────────────────────
+# ── Tool 3: Playbook process search ──────────────────────────────────────────
+
+@tool
+def query_playbook_processes(role: str, phase: str, sub_phase: str = "") -> str:
+    """Search the Project Lifecycle Playbook for processes matching a role and phase.
+
+    Use this when a user asks about their responsibilities, what they should do next,
+    or which processes apply to them at a given project phase.
+
+    Args:
+        role: The user's role (e.g. "Planning & Project Controls", "Bid Leader", "Commercial").
+        phase: The project phase (e.g. "Tender", "Design", "Construction", "Completion").
+        sub_phase: Optional sub-phase (e.g. "Detailed Design", "Mobilisation", "Handover").
+
+    Returns:
+        JSON with p1 (critical checkpoints), p2 (owned processes), p3 (contributions),
+        plus canonical role/phase labels used for matching.
+    """
+    result = search_playbook(role, phase, sub_phase)
+    return json.dumps(result)
+
+
+# ── Tool 4: Current time ──────────────────────────────────────────────────────
 
 @tool
 def get_current_time() -> str:
@@ -234,7 +292,7 @@ def get_current_time() -> str:
 
 async def init_agent(model_endpoint: str = DEFAULT_MODEL, workspace_client=None):
     endpoint = model_endpoint if model_endpoint in _VALID_ENDPOINTS else DEFAULT_MODEL
-    tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan]
+    tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan, query_playbook_processes]
     return create_agent(
         tools=tools,
         model=ChatDatabricks(endpoint=endpoint, temperature=0.2, top_p=0.5),
