@@ -26,6 +26,19 @@ from agent_server.utils import (
 
 logger = logging.getLogger(__name__)
 mlflow.langchain.autolog()
+
+AVAILABLE_MODELS = [
+    {"endpoint": "databricks-claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+    {"endpoint": "databricks-claude-opus-4-6",   "label": "Claude Opus 4.6"},
+    {"endpoint": "databricks-claude-sonnet-4-5", "label": "Claude Sonnet 4.5"},
+    {"endpoint": "databricks-claude-haiku-4-5",  "label": "Claude Haiku 4.5"},
+    {"endpoint": "databricks-gpt-oss-120b",      "label": "GPT OSS 120B"},
+    {"endpoint": "databricks-gpt-oss-20b",       "label": "GPT OSS 20B"},
+    {"endpoint": "databricks-gemma-3-12b",       "label": "Gemma 3 12B"},
+    {"endpoint": "poc-lor-classifier",           "label": "Llama 3.3 70B Instruct"},
+]
+DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
+_VALID_ENDPOINTS = {m["endpoint"] for m in AVAILABLE_MODELS}
 logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
 sp_workspace_client = WorkspaceClient()
 
@@ -227,11 +240,12 @@ def get_current_time() -> str:
 
 # ── Agent initialisation ──────────────────────────────────────────────────────
 
-async def init_agent(workspace_client=None):
+async def init_agent(model_endpoint: str = DEFAULT_MODEL, workspace_client=None):
+    endpoint = model_endpoint if model_endpoint in _VALID_ENDPOINTS else DEFAULT_MODEL
     tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan]
     return create_agent(
         tools=tools,
-        model=ChatDatabricks(endpoint="databricks-gpt-5-2"),
+        model=ChatDatabricks(endpoint=endpoint),
         system_prompt=SYSTEM_PROMPT,
     )
 
@@ -253,7 +267,11 @@ async def stream_handler(
     if session_id := get_session_id(request):
         mlflow.update_current_trace(metadata={"mlflow.trace.session": session_id})
 
-    agent = await init_agent()
+    model_endpoint = DEFAULT_MODEL
+    if request.custom_inputs and isinstance(request.custom_inputs, dict):
+        model_endpoint = request.custom_inputs.get("model_endpoint", DEFAULT_MODEL)
+
+    agent = await init_agent(model_endpoint=model_endpoint)
     messages = {"messages": to_chat_completions_input([i.model_dump() for i in request.input])}
 
     async for event in process_agent_astream_events(

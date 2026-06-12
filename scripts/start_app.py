@@ -135,6 +135,182 @@ class ProcessManager:
             print(f"Error monitoring {name}: {e}")
             self.failed.set()
 
+    # Model definitions kept in sync with agent_server/agent.py
+    AVAILABLE_MODELS = [
+        {"endpoint": "databricks-claude-sonnet-4-6", "label": "Claude Sonnet 4.6"},
+        {"endpoint": "databricks-claude-opus-4-6",   "label": "Claude Opus 4.6"},
+        {"endpoint": "databricks-claude-sonnet-4-5", "label": "Claude Sonnet 4.5"},
+        {"endpoint": "databricks-claude-haiku-4-5",  "label": "Claude Haiku 4.5"},
+        {"endpoint": "databricks-gpt-oss-120b",      "label": "GPT OSS 120B"},
+        {"endpoint": "databricks-gpt-oss-20b",       "label": "GPT OSS 20B"},
+        {"endpoint": "databricks-gemma-3-12b",       "label": "Gemma 3 12B"},
+        {"endpoint": "poc-lor-classifier",           "label": "Llama 3.3 70B Instruct"},
+    ]
+    DEFAULT_MODEL = "databricks-claude-sonnet-4-6"
+
+    def patch_frontend(self, frontend_dir: Path):
+        """Inject model selector component and wire it into the chat API calls."""
+        import json as _json
+
+        # ------------------------------------------------------------------
+        # 1. Write the ModelSelector component
+        # ------------------------------------------------------------------
+        components_dir = frontend_dir / "src" / "components"
+        components_dir.mkdir(parents=True, exist_ok=True)
+
+        options_js = _json.dumps(self.AVAILABLE_MODELS)
+        default_js = _json.dumps(self.DEFAULT_MODEL)
+
+        selector_tsx = f"""\
+"use client";
+import React from "react";
+
+export const AVAILABLE_MODELS = {options_js};
+export const DEFAULT_MODEL = {default_js};
+
+interface Props {{
+  value: string;
+  onChange: (endpoint: string) => void;
+}}
+
+export default function ModelSelector({{ value, onChange }}: Props) {{
+  return (
+    <div style={{{{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 12px",
+                   background: "var(--model-selector-bg, #f5f5f5)",
+                   borderBottom: "1px solid var(--model-selector-border, #e0e0e0)" }}}}>
+      <label htmlFor="model-select" style={{{{ fontSize: "13px", fontWeight: 500, whiteSpace: "nowrap" }}}}>
+        Model:
+      </label>
+      <select
+        id="model-select"
+        value={{value}}
+        onChange={{(e) => onChange(e.target.value)}}
+        style={{{{ fontSize: "13px", padding: "4px 8px", borderRadius: "6px",
+                  border: "1px solid #ccc", background: "white", cursor: "pointer" }}}}
+      >
+        {{AVAILABLE_MODELS.map((m) => (
+          <option key={{m.endpoint}} value={{m.endpoint}}>
+            {{m.label}}
+          </option>
+        ))}}
+      </select>
+    </div>
+  );
+}}
+"""
+        (components_dir / "ModelSelector.tsx").write_text(selector_tsx)
+
+        # ------------------------------------------------------------------
+        # 2. Patch every file that posts to the /api/chat or /invocations
+        #    endpoint by inserting custom_inputs.model_endpoint.
+        #    Strategy: find files that contain "custom_inputs" or the fetch/
+        #    post pattern and inject model state there. If the template
+        #    already has custom_inputs support we can just add our key;
+        #    otherwise we add it to the body construction.
+        # ------------------------------------------------------------------
+        src_dir = frontend_dir / "src"
+        patched_any = False
+
+        # Look for the file that builds the request body sent to the backend
+        for candidate in list(src_dir.rglob("*.ts")) + list(src_dir.rglob("*.tsx")):
+            text = candidate.read_text(errors="replace")
+
+            # Pattern 1: body already has custom_inputs object
+            if "custom_inputs" in text and "model_endpoint" not in text:
+                new_text = text.replace(
+                    "custom_inputs: {",
+                    "custom_inputs: { model_endpoint: selectedModel,",
+                )
+                if new_text != text:
+                    candidate.write_text(new_text)
+                    patched_any = True
+                    print(f"  Patched custom_inputs in {candidate.relative_to(frontend_dir)}")
+
+        if not patched_any:
+            # Pattern 2: find where the POST body is assembled (JSON.stringify / body: {)
+            # and inject custom_inputs wholesale.
+            for candidate in list(src_dir.rglob("*.ts")) + list(src_dir.rglob("*.tsx")):
+                text = candidate.read_text(errors="replace")
+                if "JSON.stringify" in text and ("input" in text or "messages" in text):
+                    # Insert custom_inputs before the closing of the stringified object
+                    # by replacing the stringify call pattern
+                    import re as _re
+                    new_text = _re.sub(
+                        r'(JSON\.stringify\s*\(\s*\{)',
+                        r'\1 custom_inputs: { model_endpoint: selectedModel },',
+                        text,
+                        count=1,
+                    )
+                    if new_text != text:
+                        candidate.write_text(new_text)
+                        patched_any = True
+                        print(f"  Patched JSON.stringify in {candidate.relative_to(frontend_dir)}")
+                        break
+
+        # ------------------------------------------------------------------
+        # 3. Patch the main page (page.tsx / page.ts) to add model state
+        #    and render <ModelSelector />.
+        # ------------------------------------------------------------------
+        page_candidates = list(src_dir.rglob("page.tsx")) + list(src_dir.rglob("page.ts"))
+        for page_file in page_candidates:
+            text = page_file.read_text(errors="replace")
+            if "selectedModel" in text:
+                # Already patched
+                break
+
+            # Add import
+            if "ModelSelector" not in text:
+                import_line = (
+                    'import ModelSelector, { DEFAULT_MODEL } from "@/components/ModelSelector";\n'
+                )
+                # Insert after the last import line
+                lines = text.splitlines(keepends=True)
+                last_import = max(
+                    (i for i, l in enumerate(lines) if l.startswith("import ")),
+                    default=0,
+                )
+                lines.insert(last_import + 1, import_line)
+                text = "".join(lines)
+
+            # Add useState for selectedModel (after "use client" or first line)
+            if "useState" in text and "selectedModel" not in text:
+                text = text.replace(
+                    "useState(",
+                    "useState(",
+                    1,  # no-op, just finding it
+                )
+                # Add state declaration inside the component function body
+                # by inserting after the first const [ ... ] = useState( pattern
+                import re as _re
+                text = _re.sub(
+                    r'(const\s+\[\w+,\s*\w+\]\s*=\s*useState\([^)]*\);)',
+                    r'\1\n  const [selectedModel, setSelectedModel] = React.useState(DEFAULT_MODEL);',
+                    text,
+                    count=1,
+                )
+
+            # Render ModelSelector before the first <div or <main
+            import re as _re
+            text = _re.sub(
+                r'(return\s*\(\s*\n?\s*)(<(?:div|main))',
+                r'\1<>\n      <ModelSelector value={selectedModel} onChange={setSelectedModel} />\n      \2',
+                text,
+                count=1,
+            )
+            # Close the fragment
+            text = _re.sub(
+                r'(\s*</(?:div|main)>\s*\)\s*;?\s*$)',
+                r'\n    </>\n  );\n',
+                text,
+                count=1,
+            )
+
+            page_file.write_text(text)
+            print(f"  Patched page component: {page_file.relative_to(frontend_dir)}")
+            break
+
+        print("Frontend model selector patch applied.")
+
     def clone_frontend_if_needed(self):
         if Path("e2e-chatbot-app-next").exists():
             return True
@@ -241,6 +417,8 @@ class ProcessManager:
             if not self.no_ui:
                 # Setup and start frontend
                 frontend_dir = Path("e2e-chatbot-app-next")
+                print("Patching frontend with model selector...")
+                self.patch_frontend(frontend_dir)
                 for cmd, desc in [("npm install", "install"), ("npm run build", "build")]:
                     print(f"Running npm {desc}...")
                     result = subprocess.run(
