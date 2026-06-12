@@ -288,37 +288,84 @@ def query_playbook_processes(role: str, phase: str, sub_phase: str = "") -> str:
 
 # ── Tool 4: Schedule-driven process workflow ─────────────────────────────────
 
-# Keywords in WBS/activity text → playbook sub-phase
-_WBS_SUBPHASE_MAP: list[tuple[str, str, str]] = [
-    # (wbs/description keyword, playbook phase, playbook sub-phase)
-    ("mobilisation", "Construction", "Mobilisation"),
-    ("mobilization", "Construction", "Mobilisation"),
-    ("onboarding", "Planning", "Onboarding / Pre-mobilisation"),
-    ("commissioning", "Construction", "Commissioning"),
-    ("handover", "Completion", "Handover"),
-    ("demobilisation", "Completion", "Demobilisation"),
-    ("demobilization", "Completion", "Demobilisation"),
-    ("dlp", "Completion", "Post-Handover / DLP"),
-    ("defect", "Completion", "Post-Handover / DLP"),
-    ("procurement", "Procurement & Supply", "Procurement"),
-    ("supply", "Procurement & Supply", "Supply / Off-Site Manufacture"),
-    ("tender", "Tender", "Bid"),
-    ("design", "Design", "Detailed Design"),
-    ("construction", "Construction", "Construction"),
-    ("delivery", "Construction", "Construction"),
+# WBS L2 segment → playbook phase
+_WBS_L2_PHASE: dict[str, str] = {
+    "construction": "Construction",
+    "commissioning": "Construction",
+    "design": "Design",
+    "procurement": "Procurement & Supply",
+    "planning": "Planning",
+    "tender": "Tender",
+    "completion": "Completion",
+    "handover": "Completion",
+    "demobilisation": "Completion",
+    "demobilization": "Completion",
+}
+
+# Ordered sub-phase signals checked against 30D activity descriptions only
+# Earlier entries take priority (most specific first)
+_SUBPHASE_SIGNALS: list[tuple[str, str, str]] = [
+    ("mobilisation",    "Construction",        "Mobilisation"),
+    ("mobilization",    "Construction",        "Mobilisation"),
+    ("commissioning",   "Construction",        "Commissioning"),
+    ("handover",        "Completion",          "Handover"),
+    ("dlp",             "Completion",          "Post-Handover / DLP"),
+    ("defect",          "Completion",          "Post-Handover / DLP"),
+    ("demobilisation",  "Completion",          "Demobilisation"),
+    ("demobilization",  "Completion",          "Demobilisation"),
+    ("procurement",     "Procurement & Supply","Procurement"),
+    ("supply",          "Procurement & Supply","Supply / Off-Site Manufacture"),
+    ("detailed design", "Design",              "Detailed Design"),
+    ("design",          "Design",              "Detailed Design"),
+    ("tender",          "Tender",              "Bid"),
+    ("onboarding",      "Planning",            "Onboarding / Pre-mobilisation"),
+    ("start-up",        "Planning",            "Project Start-up"),
 ]
 
 
-def _infer_phase_from_schedule(activities: list[dict]) -> tuple[str, str]:
-    """Infer (phase, sub_phase) from the WBS and description text of upcoming activities."""
-    text_pool = " ".join(
-        (a.get("wbs", "") + " " + a.get("description", "")).lower()
-        for a in activities
+def _infer_phase_from_schedule(
+    all_acts: list[dict], h30_acts: list[dict]
+) -> tuple[str, str]:
+    """Return (phase, sub_phase) using WBS structure then 30D activity signals.
+
+    Strategy:
+    1. Parse WBS L2 segment of P6 activities to determine the primary phase.
+    2. Scan the *30D activities only* (most imminent work) for sub-phase signals.
+    3. Fall back to phase-level defaults if no signal matches.
+    """
+    # 1. Phase from WBS L2 of P6 activities
+    phase = "Construction"  # project-level default
+    for a in all_acts:
+        if a.get("source") != "P6":
+            continue
+        parts = a.get("wbs", "").split(" > ")
+        if len(parts) >= 2:
+            l2 = parts[1].lower()
+            # Strip leading numbering like "8 - Construction"
+            l2_clean = l2.split(" - ", 1)[-1].strip()
+            if l2_clean in _WBS_L2_PHASE:
+                phase = _WBS_L2_PHASE[l2_clean]
+                break
+
+    # 2. Sub-phase from 30D activity descriptions (most imminent work wins)
+    h30_text = " ".join(
+        (a.get("description", "") + " " + a.get("wbs", "")).lower()
+        for a in h30_acts
     )
-    for keyword, phase, sub_phase in _WBS_SUBPHASE_MAP:
-        if keyword in text_pool:
-            return phase, sub_phase
-    return "Construction", "Construction"  # default for this project
+    for keyword, sig_phase, sub_phase in _SUBPHASE_SIGNALS:
+        if keyword in h30_text:
+            return sig_phase, sub_phase
+
+    # 3. Default sub-phase maps 1:1 with phase
+    _phase_default_sub = {
+        "Construction":        "Construction",
+        "Design":              "Detailed Design",
+        "Procurement & Supply":"Procurement",
+        "Planning":            "Project Start-up",
+        "Tender":              "Bid",
+        "Completion":          "Handover",
+    }
+    return phase, _phase_default_sub.get(phase, phase)
 
 
 @tool
@@ -360,17 +407,21 @@ def get_schedule_driven_processes(
     combined = p6 + [a for a in aphex if a["description"].lower() not in p6_descs]
     combined.sort(key=lambda a: a["start_date"])
 
-    # Infer phase from upcoming activities
-    inferred_phase, inferred_sub_phase = _infer_phase_from_schedule(combined)
-
     # Bucket activities into horizons
     d30 = plan_start + timedelta(days=30)
     d60 = plan_start + timedelta(days=60)
+    h30_acts = [a for a in combined if a["start_date"] <= d30]
+    h60_acts = [a for a in combined if d30 < a["start_date"] <= d60]
+    h90_acts = [a for a in combined if a["start_date"] > d60]
+
+    # Infer phase from WBS structure; sub-phase from 30D activities
+    inferred_phase, inferred_sub_phase = _infer_phase_from_schedule(combined, h30_acts)
 
     def fmt_acts(acts: list[dict], cap: int = 10) -> list[dict]:
         return [
             {
-                "date": a["start_date"].strftime("%d/%m/%Y"),
+                "start": a["start_date"].strftime("%d/%m/%Y"),
+                "end": a["end_date"].strftime("%d/%m/%Y"),
                 "code": a["activity_code"],
                 "description": a["description"],
                 "wbs": a["wbs"],
@@ -379,9 +430,9 @@ def get_schedule_driven_processes(
             for a in acts[:cap]
         ]
 
-    h30 = fmt_acts([a for a in combined if a["start_date"] <= d30])
-    h60 = fmt_acts([a for a in combined if d30 < a["start_date"] <= d60])
-    h90 = fmt_acts([a for a in combined if a["start_date"] > d60])
+    h30 = fmt_acts(h30_acts)
+    h60 = fmt_acts(h60_acts)
+    h90 = fmt_acts(h90_acts)
 
     # Query playbook with inferred phase
     playbook_result = search_playbook(role, inferred_phase, inferred_sub_phase)
