@@ -44,7 +44,7 @@ def check_port_available(port: int) -> bool:
 
 
 class ProcessManager:
-    def __init__(self, port=8000, no_ui=False, show_model_selector=True, enable_chat_history=False, enable_feedback=False):
+    def __init__(self, port=8000, no_ui=False, show_model_selector=True, enable_chat_history=False):
         self.backend_process = None
         self.frontend_process = None
         self.backend_ready = False
@@ -56,7 +56,6 @@ class ProcessManager:
         self.no_ui = no_ui
         self.show_model_selector = show_model_selector
         self.enable_chat_history = enable_chat_history
-        self.enable_feedback = enable_feedback
 
     def check_ports(self):
         """Check that required ports are available before starting processes."""
@@ -153,106 +152,7 @@ class ProcessManager:
         default_js = _json.dumps(self.DEFAULT_MODEL)
 
         # ------------------------------------------------------------------
-        # 1. Write the MessageFeedback component (thumbs up/down per message)
-        # ------------------------------------------------------------------
-        feedback_tsx = """\
-"use client";
-import React from "react";
-
-interface Props {
-  messageId: string;
-}
-
-export default function MessageFeedback({ messageId }: Props) {
-  const [vote, setVote] = React.useState<"up" | "down" | null>(null);
-
-  const submit = (value: "up" | "down") => {
-    setVote(value);
-    // Persist to localStorage so feedback survives navigation
-    try {
-      const key = `feedback:${messageId}`;
-      localStorage.setItem(key, value);
-    } catch {}
-  };
-
-  return (
-    <div style={{ display: "flex", gap: "4px", marginTop: "4px" }}>
-      <button
-        title="Helpful"
-        onClick={() => submit("up")}
-        style={{
-          background: "none", border: "none", cursor: "pointer",
-          fontSize: "16px", opacity: vote === "up" ? 1 : 0.4,
-          transition: "opacity 0.15s",
-        }}
-      >
-        👍
-      </button>
-      <button
-        title="Not helpful"
-        onClick={() => submit("down")}
-        style={{
-          background: "none", border: "none", cursor: "pointer",
-          fontSize: "16px", opacity: vote === "down" ? 1 : 0.4,
-          transition: "opacity 0.15s",
-        }}
-      >
-        👎
-      </button>
-    </div>
-  );
-}
-"""
-        (components_dir / "MessageFeedback.tsx").write_text(feedback_tsx)
-
-        # ------------------------------------------------------------------
-        # 3. Write the ChatHistory hook (localStorage-backed message store)
-        # ------------------------------------------------------------------
-        history_ts = """\
-"use client";
-import { useState, useEffect, useCallback } from "react";
-
-const STORAGE_KEY = "chat_history";
-
-export interface HistoryMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  ts: number;
-}
-
-export function useChatHistory() {
-  const [history, setHistory] = useState<HistoryMessage[]>([]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) setHistory(JSON.parse(raw));
-    } catch {}
-  }, []);
-
-  const addMessage = useCallback((msg: Omit<HistoryMessage, "id" | "ts">) => {
-    setHistory((prev) => {
-      const next = [...prev, { ...msg, id: crypto.randomUUID(), ts: Date.now() }];
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
-      return next;
-    });
-  }, []);
-
-  const clearHistory = useCallback(() => {
-    setHistory([]);
-    try { localStorage.removeItem(STORAGE_KEY); } catch {}
-  }, []);
-
-  return { history, addMessage, clearHistory };
-}
-"""
-        hooks_dir = frontend_dir / "src" / "hooks"
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        (hooks_dir / "useChatHistory.ts").write_text(history_ts)
-
-        # ------------------------------------------------------------------
-        # 4. Write AgentToolbar — a self-contained overlay that:
+        # 1. Write AgentToolbar — a self-contained overlay that:
         #    - Shows the model selector (reads/writes localStorage)
         #    - Monkey-patches window.fetch to inject custom_inputs.model_endpoint
         #    - Shows thumbs up/down feedback on assistant messages (optional)
@@ -261,7 +161,6 @@ export function useChatHistory() {
         #    of how the template structures its components or imports.
         # ------------------------------------------------------------------
         show_model_js = "true" if self.show_model_selector else "false"
-        enable_feedback_js = "true" if self.enable_feedback else "false"
         enable_history_js = "true" if self.enable_chat_history else "false"
 
         toolbar_tsx = f"""\
@@ -274,7 +173,6 @@ const DEFAULT_MODEL = {default_js};
 const STORAGE_KEY = "agent_selected_model";
 const HISTORY_KEY = "agent_chat_history";
 const SHOW_MODEL_SELECTOR = {show_model_js};
-const ENABLE_FEEDBACK = {enable_feedback_js};
 const ENABLE_HISTORY = {enable_history_js};
 
 function getStoredModel(): string {{
@@ -437,8 +335,6 @@ export default function AgentToolbar() {{
             features.append("model selector")
         if self.enable_chat_history:
             features.append("chat history")
-        if self.enable_feedback:
-            features.append("feedback")
         print(f"Frontend patch applied ({', '.join(features) or 'no extras'}).")
 
         # ------------------------------------------------------------------
@@ -604,7 +500,7 @@ export default function AgentToolbar() {{
             if not self.no_ui:
                 # Setup and start frontend
                 frontend_dir = Path("e2e-chatbot-app-next")
-                print("Patching frontend with model selector...")
+                print("Patching frontend...")
                 self.patch_frontend(frontend_dir)
                 for cmd, desc in [("npm install", "install"), ("npm run build", "build")]:
                     print(f"Running npm {desc}...")
@@ -680,15 +576,10 @@ def main():
         help="Run backend only, skip frontend UI",
     )
     parser.add_argument(
-        "--show-model-selector",
-        action="store_true",
-        default=True,
-        help="Show the model selector dropdown in the chat UI (default: enabled)",
-    )
-    parser.add_argument(
         "--no-model-selector",
         dest="show_model_selector",
         action="store_false",
+        default=True,
         help="Hide the model selector dropdown in the chat UI",
     )
     parser.add_argument(
@@ -696,12 +587,6 @@ def main():
         action="store_true",
         default=False,
         help="Enable localStorage-backed chat history in the chat UI",
-    )
-    parser.add_argument(
-        "--enable-feedback",
-        action="store_true",
-        default=False,
-        help="Enable thumbs up/down feedback buttons on each message",
     )
     args, backend_args = parser.parse_known_args()
 
@@ -721,7 +606,6 @@ def main():
             no_ui=args.no_ui,
             show_model_selector=args.show_model_selector,
             enable_chat_history=args.enable_chat_history,
-            enable_feedback=args.enable_feedback,
         ).run(backend_args)
     )
 
