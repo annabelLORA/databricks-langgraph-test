@@ -18,7 +18,7 @@ from mlflow.types.responses import (
 
 from agent_server.file_store import store_file
 from agent_server.hse_planner import build_risk_plan, write_excel
-from agent_server.knowledge import get_activities_in_window
+from agent_server.knowledge import P6_ACTIVITIES, APHEX_ACTIVITIES, get_activities_in_window
 from agent_server.models import AVAILABLE_MODELS, DEFAULT_MODEL
 from agent_server.playbook import search_playbook
 from agent_server.utils import (
@@ -40,29 +40,35 @@ You are ALSO the **Project Lifecycle Playbook Assistant**. Activate this workflo
 asks about process, next steps, what they should do, their responsibilities, or anything that implies
 they want to know which playbook processes apply to their role and phase.
 
-### Intake Gate (MANDATORY before calling the playbook tool)
-You CANNOT give useful guidance without knowing BOTH the user's **role** AND their **project phase**.
+### Intake Gate
+You CANNOT give useful guidance without knowing the user's **role**.
+The **project phase** can be inferred from the live schedule if the user doesn't know it — use
+`get_schedule_driven_processes` in that case (it reads the schedule and maps to playbook phases).
 
-If either is missing, reply ONLY with:
+**Decision tree:**
+- User provides BOTH role AND phase → call `query_playbook_processes` directly.
+- User provides role but NOT phase → call `get_schedule_driven_processes` (pass the role; it will
+  infer the phase from the schedule and return combined schedule + playbook context).
+- User provides NEITHER → ask for their role only (the tool can derive the phase from the schedule).
 
-> To point you to the right actions I need two quick things:
-> **1. Your role** — e.g. Planning & Project Controls, Project Leader, Bid Leader, Commercial,
+If the role is missing, reply ONLY with:
+
+> To point you to the right actions I need one quick thing:
+> **Your role** — e.g. Planning & Project Controls, Project Leader, Bid Leader, Commercial,
 > Delivery Leader, Design, Commissioning/Services, Quality, HSE, Procurement, Digital, etc.
-> **2. Your current phase** — Tender · Planning · Procurement & Supply · Design · Construction ·
-> Completion (and the sub-phase if you know it, e.g. Detailed Design, Mobilisation, Handover).
 
-Only ask for the missing part. Do NOT list example tasks or pre-empt the answer.
-
-Once you have BOTH, call the `query_playbook_processes` tool with the role, phase, and sub-phase.
+Do NOT ask for the phase if the role is known — the schedule can supply it.
 
 ### Response format after retrieval
 1. One-line confirmation of how you read the question.
-2. **Recommended actions by priority** — group under:
+2. **📅 Schedule context** (from `get_schedule_driven_processes` only) — bullet the top upcoming
+   activities grouped by horizon (30D / 60D / 90D), noting inferred phase and sub-phase.
+3. **Recommended actions by priority** — group under:
    - **🔴 P1 – Critical** (Functional Checkpoints / formal gateways)
    - **🟠 P2 – You own this** (Primary Responsible)
    - **🟢 P3 – Support/contribute** (Secondary Responsible)
    Each action: **Bold title** *(ID, Sub-Phase)*, one sentence on what to do, Owner/with, gateway flag if applicable, and supporting links as `[Title](URL)`.
-3. A closing note: **"What unlocks the next phase"** — flag the checkpoints to clear.
+4. A closing note: **"What unlocks the next phase"** — flag the checkpoints to clear.
 
 Hyperlink rules: always use `[Readable title](URL)` — never bare URLs, never invented URLs.
 If no link exists, write *"No linked reference."*
@@ -280,7 +286,122 @@ def query_playbook_processes(role: str, phase: str, sub_phase: str = "") -> str:
     return json.dumps(result)
 
 
-# ── Tool 4: Current time ──────────────────────────────────────────────────────
+# ── Tool 4: Schedule-driven process workflow ─────────────────────────────────
+
+# Keywords in WBS/activity text → playbook sub-phase
+_WBS_SUBPHASE_MAP: list[tuple[str, str, str]] = [
+    # (wbs/description keyword, playbook phase, playbook sub-phase)
+    ("mobilisation", "Construction", "Mobilisation"),
+    ("mobilization", "Construction", "Mobilisation"),
+    ("onboarding", "Planning", "Onboarding / Pre-mobilisation"),
+    ("commissioning", "Construction", "Commissioning"),
+    ("handover", "Completion", "Handover"),
+    ("demobilisation", "Completion", "Demobilisation"),
+    ("demobilization", "Completion", "Demobilisation"),
+    ("dlp", "Completion", "Post-Handover / DLP"),
+    ("defect", "Completion", "Post-Handover / DLP"),
+    ("procurement", "Procurement & Supply", "Procurement"),
+    ("supply", "Procurement & Supply", "Supply / Off-Site Manufacture"),
+    ("tender", "Tender", "Bid"),
+    ("design", "Design", "Detailed Design"),
+    ("construction", "Construction", "Construction"),
+    ("delivery", "Construction", "Construction"),
+]
+
+
+def _infer_phase_from_schedule(activities: list[dict]) -> tuple[str, str]:
+    """Infer (phase, sub_phase) from the WBS and description text of upcoming activities."""
+    text_pool = " ".join(
+        (a.get("wbs", "") + " " + a.get("description", "")).lower()
+        for a in activities
+    )
+    for keyword, phase, sub_phase in _WBS_SUBPHASE_MAP:
+        if keyword in text_pool:
+            return phase, sub_phase
+    return "Construction", "Construction"  # default for this project
+
+
+@tool
+def get_schedule_driven_processes(
+    role: str,
+    start_date: str = "",
+    keyword_filter: str = "",
+) -> str:
+    """Combine live schedule data with playbook processes for a given role.
+
+    Use this when the user asks what they should be doing, what's next, or what their
+    responsibilities are — especially when they haven't specified a project phase.
+    The tool reads the schedule to infer the current phase and sub-phase, then looks up
+    the matching playbook processes, returning a unified response.
+
+    Args:
+        role: The user's role (e.g. "Planning & Project Controls", "HSE", "Commercial").
+        start_date: Window start in DD/MM/YYYY format. Defaults to today.
+        keyword_filter: Optional keyword to filter schedule activities (e.g. 'concrete').
+
+    Returns:
+        JSON with inferred phase, upcoming schedule activities by horizon, and matched
+        playbook processes (p1/p2/p3).
+    """
+    from datetime import timedelta
+
+    if start_date:
+        try:
+            plan_start = datetime.strptime(start_date.strip(), "%d/%m/%Y")
+        except ValueError:
+            plan_start = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        plan_start = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Pull combined schedule
+    p6 = get_activities_in_window(plan_start, 90, keyword_filter, "P6")
+    aphex = get_activities_in_window(plan_start, 90, keyword_filter, "Aphex")
+    p6_descs = {a["description"].lower() for a in p6}
+    combined = p6 + [a for a in aphex if a["description"].lower() not in p6_descs]
+    combined.sort(key=lambda a: a["start_date"])
+
+    # Infer phase from upcoming activities
+    inferred_phase, inferred_sub_phase = _infer_phase_from_schedule(combined)
+
+    # Bucket activities into horizons
+    d30 = plan_start + timedelta(days=30)
+    d60 = plan_start + timedelta(days=60)
+
+    def fmt_acts(acts: list[dict], cap: int = 10) -> list[dict]:
+        return [
+            {
+                "date": a["start_date"].strftime("%d/%m/%Y"),
+                "code": a["activity_code"],
+                "description": a["description"],
+                "wbs": a["wbs"],
+                "source": a["source"],
+            }
+            for a in acts[:cap]
+        ]
+
+    h30 = fmt_acts([a for a in combined if a["start_date"] <= d30])
+    h60 = fmt_acts([a for a in combined if d30 < a["start_date"] <= d60])
+    h90 = fmt_acts([a for a in combined if a["start_date"] > d60])
+
+    # Query playbook with inferred phase
+    playbook_result = search_playbook(role, inferred_phase, inferred_sub_phase)
+
+    return json.dumps({
+        "window_start": plan_start.strftime("%d/%m/%Y"),
+        "keyword_filter": keyword_filter or "(none)",
+        "inferred_phase": inferred_phase,
+        "inferred_sub_phase": inferred_sub_phase,
+        "schedule": {
+            "30D": {"count": len(h30), "activities": h30},
+            "60D": {"count": len(h60), "activities": h60},
+            "90D": {"count": len(h90), "activities": h90},
+            "total": len(combined),
+        },
+        "playbook": playbook_result,
+    })
+
+
+# ── Tool 5: Current time ──────────────────────────────────────────────────────
 
 @tool
 def get_current_time() -> str:
@@ -297,7 +418,7 @@ async def init_agent(model_endpoint: str = DEFAULT_MODEL, workspace_client=None)
     endpoint = model_endpoint if model_endpoint in _VALID_ENDPOINTS else DEFAULT_MODEL
     if endpoint in _agent_cache:
         return _agent_cache[endpoint]
-    tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan, query_playbook_processes]
+    tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan, query_playbook_processes, get_schedule_driven_processes]
     agent = create_agent(
         tools=tools,
         model=ChatDatabricks(
