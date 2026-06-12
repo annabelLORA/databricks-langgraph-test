@@ -1,12 +1,10 @@
 import base64
-import io
 import json
 import logging
 from datetime import datetime
 from typing import AsyncGenerator, Optional
 
 import mlflow
-import openpyxl
 from databricks.sdk import WorkspaceClient
 from databricks_langchain import ChatDatabricks
 from langchain.agents import create_agent
@@ -18,9 +16,9 @@ from mlflow.types.responses import (
     ResponsesAgentStreamEvent,
     to_chat_completions_input,
 )
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
+from agent_server.hse_planner import build_risk_plan, write_excel
+from agent_server.knowledge import get_activities_in_window
 from agent_server.utils import (
     get_session_id,
     process_agent_astream_events,
@@ -31,323 +29,195 @@ mlflow.langchain.autolog()
 logging.getLogger("mlflow.utils.autologging_utils").setLevel(logging.ERROR)
 sp_workspace_client = WorkspaceClient()
 
-SYSTEM_PROMPT = """You are a construction industry expert assistant for Laing O'Rourke, \
-specialising in construction management, engineering processes, safety, quality, and risk.
+SYSTEM_PROMPT = """You are a Civil Engineering HSE Risk Planning Specialist for Laing O'Rourke. \
+Strict Australian English. No preamble, commentary, or meta-text. Generate everything from \
+project knowledge only. If required input is missing, ask before generating.
 
-You handle three types of requests:
+You handle two types of requests:
 
 **1. General Construction Q&A**
-Answer questions about construction methods, materials, engineering principles, \
-site management, safety standards, procurement, contracts, and industry best practices. \
-Be clear, practical, and accurate.
+Answer questions about construction methods, HSE standards, risk management, engineering \
+principles, site management, safety regulations, and industry best practices. Be clear, \
+practical, and accurate. Cite AS/NZS standards and Australian legislation where applicable.
 
-**2. Process Guidance with References**
-When asked about specific construction processes or "what are the next steps for X", \
-use the `get_construction_process` tool to retrieve structured step-by-step guidance \
-with relevant standards and reference links. Always present steps in a numbered list \
-with the reference links clearly shown.
+**2. HSE Risk Plan Generation (30/60/90 Day)**
+Detect when the user is asking for a risk plan, risk register, SWMS, JSA, 30/60/90 plan, \
+or HSE risk assessment. Extract the following from the message (ask if missing):
+  - project_name: Project/Office/Depot name
+  - start_date: Plan start date in DD/MM/YYYY format (default: today if not given)
+  - work_pack: Work pack description (e.g. "Bridge Deck Concrete Works — June 2026")
+  - person_responsible: Name or role (default: [Assignee] if not given)
+  - work_pack_filter: Optional keyword to filter schedule activities (e.g. "concrete", "crane")
 
-**3. Risk Plan Excel Generation**
-When asked to generate a risk plan, risk register, or risk assessment for a project, \
-use the `generate_risk_plan_excel` tool. First, analyse the user's project description \
-to identify the key risks (likelihood, consequence, controls). Then call the tool with \
-those risks. Present the result clearly and tell the user how to decode and save the file.
+Once you have those, call `generate_hse_risk_plan`. The tool will:
+- Pull real scheduled activities from the P6/Aphex project programme
+- Classify each activity to HSE risk categories
+- Select applicable FSR/SER and cross-cutting controls from the HSE Controls library
+- Apply the 30/60/90 day horizon logic (5 Top 5 risks per horizon)
+- Populate and return the base template workbook as a downloadable Excel file
 
-Always be professional, concise, and safety-conscious. When citing standards, \
-prefer AS/NZS standards where applicable (Australian context).
+After the tool responds, present:
+1. A brief executive narrative: Horizon → Risk Cluster → key mitigation
+2. Instructions for the user to save the Excel file (decode base64 or use the download link)
+
+Never fabricate risk details, categories, or controls — everything comes from the project data.
 """
 
-# ── Workflow 2: Process guidance ──────────────────────────────────────────────
 
-CONSTRUCTION_PROCESSES = {
-    "excavation": {
-        "title": "Excavation & Earthworks",
-        "steps": [
-            "Obtain site survey and geotechnical investigation report",
-            "Submit and approve Excavation Method Statement / Safe Work Method Statement (SWMS)",
-            "Identify and mark all underground services (Dial Before You Dig)",
-            "Install erosion and sediment controls (silt fences, sediment basins)",
-            "Set out excavation boundaries and establish benchmarks",
-            "Begin excavation with shoring/benching/battering as per design",
-            "Monitor excavation for groundwater, instability, and contamination",
-            "Complete inspection and approval prior to blinding/formwork",
-        ],
-        "references": [
-            ("AS 3798 – Guidelines on earthworks", "https://www.standards.org.au/standards-catalogue/sa-snz/building/me-001/as-3798-2007"),
-            ("Safe Work Australia – Excavation SWMS", "https://www.safeworkaustralia.gov.au/doc/model-code-of-practice-excavation-work"),
-            ("Dial Before You Dig", "https://www.1100.com.au"),
-        ],
-    },
-    "concrete": {
-        "title": "Concrete Placement",
-        "steps": [
-            "Review structural drawings and mix design specifications",
-            "Inspect and approve formwork, reinforcement, and embedments",
-            "Conduct pre-pour inspection and obtain approval",
-            "Order concrete to approved mix design; verify delivery dockets",
-            "Place and compact concrete (vibrate to eliminate voids)",
-            "Finish surface to specified tolerances",
-            "Implement curing regime (wet hessian, curing compound, or formwork retention)",
-            "Test cubes/cylinders taken per AS 1012; record results",
-            "Strip formwork at approved time and inspect for defects",
-        ],
-        "references": [
-            ("AS 3600 – Concrete Structures", "https://www.standards.org.au/standards-catalogue/sa-snz/building/bd-002/as-3600-2018"),
-            ("AS 1379 – Specification and Supply of Concrete", "https://www.standards.org.au/standards-catalogue/sa-snz/building/bd-001/as-1379-2007"),
-            ("AS 1012 – Methods of Testing Concrete", "https://www.standards.org.au/standards-catalogue/sa-snz/building/bd-001/as-1012-9-2014"),
-        ],
-    },
-    "scaffolding": {
-        "title": "Scaffolding Erection & Use",
-        "steps": [
-            "Determine scaffold type (system, tube-and-coupler, suspended) per task requirements",
-            "Engage licensed scaffolder (Class 2 or above as required)",
-            "Prepare scaffold design and load calculations for complex structures",
-            "Inspect base plates, sole boards, and ground bearing capacity",
-            "Erect scaffold with ties, bracing, and guardrails per design",
-            "Conduct handover inspection and issue Scafftag / scaffold tag",
-            "Conduct weekly inspections and after any adverse weather event",
-            "Ensure all users complete scaffold awareness training",
-            "Dismantle scaffold in reverse order under scaffolder supervision",
-        ],
-        "references": [
-            ("AS/NZS 4576 – Guidelines for scaffolding", "https://www.standards.org.au/standards-catalogue/sa-snz/building/me-001/as-nzs-4576-1995"),
-            ("Safe Work Australia – Scaffolding Code", "https://www.safeworkaustralia.gov.au/doc/model-code-of-practice-managing-risks-falls-general-construction"),
-            ("WorkSafe Scaffold Licensing", "https://www.safeworkaustralia.gov.au/licensing"),
-        ],
-    },
-    "commissioning": {
-        "title": "Commissioning & Handover",
-        "steps": [
-            "Develop Commissioning Management Plan aligned to contract requirements",
-            "Complete pre-commissioning punch list and close-out all items",
-            "Conduct factory acceptance tests (FAT) and site acceptance tests (SAT)",
-            "Verify all O&M manuals, warranties, and as-built drawings are complete",
-            "Complete integrated systems testing (IST) across disciplines",
-            "Conduct training for client's operations and maintenance staff",
-            "Obtain all regulatory approvals, certificates of occupancy/completion",
-            "Achieve Practical Completion milestone and issue to client",
-            "Monitor defects liability period (DLP) and close-out defects",
-        ],
-        "references": [
-            ("AIPM – Commissioning Guidance", "https://www.aipm.com.au"),
-            ("ISO 10005 – Quality Management Plans", "https://www.iso.org/standard/72621.html"),
-            ("Laing O'Rourke Project Controls Framework", "https://www.laingorourke.com"),
-        ],
-    },
-    "default": {
-        "title": "General Construction Process",
-        "steps": [
-            "Confirm scope, specifications, and design documentation are approved",
-            "Prepare and approve Method Statement / Safe Work Method Statement",
-            "Check permits, approvals, and hold points required",
-            "Confirm resources (labour, plant, materials) are mobilised and inspected",
-            "Conduct pre-work toolbox talk and site induction for all workers",
-            "Execute works to approved method statement with ITP sign-offs",
-            "Conduct inspections at each hold point; obtain approvals before proceeding",
-            "Document quality records, non-conformances, and corrective actions",
-            "Complete works and obtain sign-off for next phase or handover",
-        ],
-        "references": [
-            ("AS/NZS ISO 45001 – Occupational Health and Safety", "https://www.standards.org.au/standards-catalogue/sa-snz/publicsafety/sf-001/as-nzs-iso-45001-2018"),
-            ("AS/NZS ISO 9001 – Quality Management Systems", "https://www.standards.org.au/standards-catalogue/sa-snz/generaltechnologies/qr-001/as-nzs-iso-9001-2016"),
-            ("Safe Work Australia", "https://www.safeworkaustralia.gov.au"),
-        ],
-    },
-}
-
+# ── Tool 1: HSE Risk Plan Generation ─────────────────────────────────────────
 
 @tool
-def get_construction_process(process_name: str) -> str:
-    """Get step-by-step guidance and reference links for a named construction process.
+def generate_hse_risk_plan(
+    project_name: str,
+    start_date: str,
+    work_pack: str,
+    person_responsible: str,
+    work_pack_filter: str = "",
+) -> str:
+    """Generate a 30/60/90 day HSE Risk Plan Excel workbook from the project schedule.
 
     Args:
-        process_name: The construction process to look up (e.g. 'excavation', 'concrete',
-                      'scaffolding', 'commissioning', or any general description).
-    """
-    key = process_name.lower().strip()
-    # fuzzy match on keywords
-    matched = next(
-        (v for k, v in CONSTRUCTION_PROCESSES.items() if k != "default" and k in key),
-        CONSTRUCTION_PROCESSES["default"],
-    )
-    steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(matched["steps"]))
-    refs_text = "\n".join(f"  - [{name}]({url})" for name, url in matched["references"])
-    return (
-        f"## {matched['title']}\n\n"
-        f"### Steps\n{steps_text}\n\n"
-        f"### Reference Standards & Links\n{refs_text}"
-    )
-
-
-# ── Workflow 3: Risk plan Excel generation ────────────────────────────────────
-
-RISK_COLORS = {
-    "Extreme": "C00000",
-    "High": "FF0000",
-    "Medium": "FFC000",
-    "Low": "92D050",
-}
-
-LIKELIHOOD_SCORE = {"Rare": 1, "Unlikely": 2, "Possible": 3, "Likely": 4, "Almost Certain": 5}
-CONSEQUENCE_SCORE = {"Insignificant": 1, "Minor": 2, "Moderate": 3, "Major": 4, "Catastrophic": 5}
-
-
-def _risk_rating(likelihood: str, consequence: str) -> str:
-    l = LIKELIHOOD_SCORE.get(likelihood, 3)
-    c = CONSEQUENCE_SCORE.get(consequence, 3)
-    score = l * c
-    if score >= 15:
-        return "Extreme"
-    elif score >= 8:
-        return "High"
-    elif score >= 4:
-        return "Medium"
-    return "Low"
-
-
-def _build_excel(project_name: str, risks: list[dict]) -> bytes:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Risk Register"
-
-    # Title
-    ws.merge_cells("A1:J1")
-    title_cell = ws["A1"]
-    title_cell.value = f"Risk Plan — {project_name}"
-    title_cell.font = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
-    title_cell.fill = PatternFill("solid", fgColor="1F3864")
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 28
-
-    ws["A2"] = f"Generated: {datetime.now().strftime('%d %b %Y')}    |    Organisation: Laing O'Rourke"
-    ws["A2"].font = Font(italic=True, color="595959")
-    ws.merge_cells("A2:J2")
-
-    # Headers
-    headers = [
-        "Risk ID", "Risk Description", "Category", "Likelihood",
-        "Consequence", "Risk Rating", "Controls / Mitigation",
-        "Residual Likelihood", "Residual Consequence", "Residual Rating",
-    ]
-    header_row = 4
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=header_row, column=col, value=h)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="2E75B6")
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-
-    ws.row_dimensions[header_row].height = 36
-
-    # Data rows
-    for i, risk in enumerate(risks, 1):
-        row = header_row + i
-        likelihood = risk.get("likelihood", "Possible")
-        consequence = risk.get("consequence", "Moderate")
-        residual_likelihood = risk.get("residual_likelihood", "Unlikely")
-        residual_consequence = risk.get("residual_consequence", "Minor")
-        rating = _risk_rating(likelihood, consequence)
-        residual_rating = _risk_rating(residual_likelihood, residual_consequence)
-
-        values = [
-            f"R{i:02d}",
-            risk.get("description", ""),
-            risk.get("category", "General"),
-            likelihood,
-            consequence,
-            rating,
-            risk.get("controls", ""),
-            residual_likelihood,
-            residual_consequence,
-            residual_rating,
-        ]
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row=row, column=col, value=val)
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-            if col in (6, 10):  # rating columns
-                color = RISK_COLORS.get(val, "FFFFFF")
-                cell.fill = PatternFill("solid", fgColor=color)
-                cell.font = Font(bold=True, color="FFFFFF" if val in ("Extreme", "High") else "000000")
-        ws.row_dimensions[row].height = 45
-
-    # Column widths
-    col_widths = [8, 40, 18, 16, 16, 14, 50, 18, 18, 14]
-    for col, width in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(col)].width = width
-
-    # Risk matrix legend sheet
-    ws2 = wb.create_sheet("Risk Matrix")
-    ws2["A1"] = "Risk Rating Matrix"
-    ws2["A1"].font = Font(bold=True, size=13)
-    ws2.merge_cells("A1:F1")
-
-    matrix_headers = ["", "Insignificant", "Minor", "Moderate", "Major", "Catastrophic"]
-    likelihood_labels = ["Almost Certain", "Likely", "Possible", "Unlikely", "Rare"]
-    matrix_colors = [
-        ["FF0000", "FF0000", "C00000", "C00000", "C00000"],
-        ["FFC000", "FF0000", "FF0000", "C00000", "C00000"],
-        ["92D050", "FFC000", "FF0000", "FF0000", "C00000"],
-        ["92D050", "92D050", "FFC000", "FFC000", "FF0000"],
-        ["92D050", "92D050", "92D050", "FFC000", "FFC000"],
-    ]
-
-    for col, h in enumerate(matrix_headers, 1):
-        cell = ws2.cell(row=3, column=col, value=h)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center")
-
-    for r, label in enumerate(likelihood_labels, 1):
-        ws2.cell(row=3 + r, column=1, value=label).font = Font(bold=True)
-        for c, color in enumerate(matrix_colors[r - 1], 2):
-            cell = ws2.cell(row=3 + r, column=c)
-            cell.fill = PatternFill("solid", fgColor=color)
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-@tool
-def generate_risk_plan_excel(project_name: str, risks_json: str) -> str:
-    """Generate a risk plan Excel workbook for a construction project.
-
-    Args:
-        project_name: Name of the project.
-        risks_json: JSON array of risk objects. Each object should have:
-            - description (str): What the risk is
-            - category (str): e.g. 'Safety', 'Programme', 'Cost', 'Environment', 'Quality'
-            - likelihood (str): 'Rare' | 'Unlikely' | 'Possible' | 'Likely' | 'Almost Certain'
-            - consequence (str): 'Insignificant' | 'Minor' | 'Moderate' | 'Major' | 'Catastrophic'
-            - controls (str): Mitigation measures
-            - residual_likelihood (str): Same scale as likelihood after controls
-            - residual_consequence (str): Same scale as consequence after controls
+        project_name: Project/Office/Depot name (written into B1 of the template).
+        start_date: Plan start date in DD/MM/YYYY format (e.g. "12/06/2026").
+        work_pack: Work pack description for the plan name (e.g. "Bridge Deck Concrete").
+        person_responsible: Person responsible text for every row (e.g. "[Assignee]" or a name).
+        work_pack_filter: Optional keyword to filter schedule activities (e.g. "concrete").
+                          Leave blank to include all activities in the 90-day window.
 
     Returns:
-        JSON with base64 encoded Excel file content and filename.
+        JSON with base64-encoded Excel file, filename, row count, and executive summary.
     """
     try:
-        risks = json.loads(risks_json)
-    except json.JSONDecodeError as e:
-        return f"Error parsing risks JSON: {e}"
+        plan_start = datetime.strptime(start_date.strip(), "%d/%m/%Y")
+    except ValueError:
+        return json.dumps({"error": f"Invalid start_date format: {start_date!r}. Use DD/MM/YYYY."})
 
-    excel_bytes = _build_excel(project_name, risks)
+    # Pull activities from both P6 and Aphex; combine and de-duplicate by description
+    p6_acts = get_activities_in_window(plan_start, days=90, keyword_filter=work_pack_filter, source="P6")
+    aphex_acts = get_activities_in_window(plan_start, days=90, keyword_filter=work_pack_filter, source="Aphex")
+
+    # Prefer P6 where descriptions overlap; otherwise merge
+    p6_descs = {a["description"].lower() for a in p6_acts}
+    combined = p6_acts + [a for a in aphex_acts if a["description"].lower() not in p6_descs]
+    combined.sort(key=lambda a: a["start_date"])
+
+    # Cap per horizon to keep Excel manageable (max 10 tasks × ~8 controls = ~80 rows per horizon)
+    from datetime import timedelta
+    d30 = plan_start + timedelta(days=30)
+    d60 = plan_start + timedelta(days=60)
+    h30 = [a for a in combined if a["start_date"] <= d30][:10]
+    h60 = [a for a in combined if d30 < a["start_date"] <= d60][:10]
+    h90 = [a for a in combined if d60 < a["start_date"]][:10]
+    combined = h30 + h60 + h90
+
+    if not combined:
+        return json.dumps({
+            "error": (
+                f"No activities found in the 90-day window starting {start_date} "
+                f"matching filter: {work_pack_filter!r}. "
+                "Try a broader filter or leave work_pack_filter blank."
+            )
+        })
+
+    rows = build_risk_plan(combined, plan_start, person_responsible)
+
+    start_month_year = plan_start.strftime("%B %Y")
+    excel_bytes = write_excel(project_name, work_pack, start_month_year, rows)
     b64 = base64.b64encode(excel_bytes).decode("utf-8")
-    filename = f"risk_plan_{project_name.replace(' ', '_').lower()}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+
+    date_str = plan_start.strftime("%d_%m_%Y")
+    filename = f"{date_str} - 30-60-90 - {work_pack} - {start_month_year}.xlsx"
+
+    # Build summary per horizon
+    from collections import Counter
+    def hz_summary(hz: str) -> dict:
+        hz_rows = [r for r in rows if r["Timing"] == hz]
+        tasks = list(dict.fromkeys(r["Job Task.Record No."] for r in hz_rows))
+        top5 = [r["Job Task.Record No."] for r in hz_rows if r["Top 5 Risk"] == "True"]
+        categories = Counter(r["Risk Category.Name"] for r in hz_rows)
+        return {
+            "task_count": len(tasks),
+            "control_rows": len(hz_rows),
+            "top5_tasks": list(dict.fromkeys(top5)),
+            "top_categories": [cat for cat, _ in categories.most_common(5)],
+        }
+
+    summary = {hz: hz_summary(hz) for hz in ("30D", "60D", "90D")}
 
     return json.dumps({
         "filename": filename,
         "content_base64": b64,
-        "risk_count": len(risks),
+        "total_rows": len(rows),
+        "activity_count": len(combined),
+        "summary": summary,
         "message": (
-            f"Excel risk plan generated with {len(risks)} risks. "
+            f"Risk plan generated: {len(rows)} control rows across {len(combined)} activities. "
             f"Filename: {filename}. "
-            "To save: copy the content_base64 value, decode from base64, and save as .xlsx. "
-            "In Python: import base64; open('risk_plan.xlsx','wb').write(base64.b64decode('<content_base64>'))"
+            "To save in Python: "
+            "import base64; open('risk_plan.xlsx','wb').write(base64.b64decode(result['content_base64']))"
         ),
     })
 
 
-# ── Agent initialisation ──────────────────────────────────────────────────────
+# ── Tool 2: Schedule preview ──────────────────────────────────────────────────
+
+@tool
+def get_schedule_activities(start_date: str = "", keyword_filter: str = "") -> str:
+    """Preview project schedule activities in the 30/60/90 day window.
+
+    Use this to check what activities are available before generating a full risk plan,
+    or to answer general questions about the upcoming programme.
+
+    Args:
+        start_date: Window start in DD/MM/YYYY format. Defaults to today.
+        keyword_filter: Optional keyword to filter activities (e.g. 'crane', 'concrete').
+
+    Returns:
+        JSON summary of activities by horizon.
+    """
+    if start_date:
+        try:
+            plan_start = datetime.strptime(start_date.strip(), "%d/%m/%Y")
+        except ValueError:
+            plan_start = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        plan_start = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    p6 = get_activities_in_window(plan_start, 90, keyword_filter, "P6")
+    aphex = get_activities_in_window(plan_start, 90, keyword_filter, "Aphex")
+    p6_descs = {a["description"].lower() for a in p6}
+    combined = p6 + [a for a in aphex if a["description"].lower() not in p6_descs]
+    combined.sort(key=lambda a: a["start_date"])
+
+    d30 = plan_start
+    d30_end = plan_start.__class__(plan_start.year, plan_start.month, plan_start.day)
+    from datetime import timedelta
+    h30 = [a for a in combined if (a["start_date"] - plan_start).days <= 30]
+    h60 = [a for a in combined if 30 < (a["start_date"] - plan_start).days <= 60]
+    h90 = [a for a in combined if 60 < (a["start_date"] - plan_start).days <= 90]
+
+    def fmt(acts):
+        return [
+            {
+                "date": a["start_date"].strftime("%d/%m/%Y"),
+                "code": a["activity_code"],
+                "description": a["description"],
+                "source": a["source"],
+            }
+            for a in acts[:20]
+        ]
+
+    return json.dumps({
+        "window_start": plan_start.strftime("%d/%m/%Y"),
+        "filter": keyword_filter or "(none)",
+        "30D": {"count": len(h30), "activities": fmt(h30)},
+        "60D": {"count": len(h60), "activities": fmt(h60)},
+        "90D": {"count": len(h90), "activities": fmt(h90)},
+        "total": len(combined),
+    })
+
+
+# ── Tool 3: Current time ──────────────────────────────────────────────────────
 
 @tool
 def get_current_time() -> str:
@@ -355,8 +225,10 @@ def get_current_time() -> str:
     return datetime.now().isoformat()
 
 
+# ── Agent initialisation ──────────────────────────────────────────────────────
+
 async def init_agent(workspace_client=None):
-    tools = [get_current_time, get_construction_process, generate_risk_plan_excel]
+    tools = [get_current_time, get_schedule_activities, generate_hse_risk_plan]
     return create_agent(
         tools=tools,
         model=ChatDatabricks(endpoint="databricks-gpt-5-2"),
