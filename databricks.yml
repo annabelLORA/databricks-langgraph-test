@@ -4,7 +4,7 @@ bundle:
 resources:
   apps:
     agent_langgraph:
-      name: "agent-langgraph"
+      name: "agent-langgraph-test"
       description: "LangGraph agent application"
       source_code_path: ./
       config:
@@ -27,7 +27,7 @@ resources:
       resources:
         - name: 'experiment'
           experiment:
-            experiment_id: ""
+            experiment_id: "431420656000249"
             permission: 'CAN_MANAGE'
 
 targets:
