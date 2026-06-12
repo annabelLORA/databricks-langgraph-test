@@ -232,7 +232,7 @@ async def init_agent(workspace_client=None):
     return create_agent(
         tools=tools,
         model=ChatDatabricks(endpoint="databricks-gpt-5-2"),
-        prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT,
     )
 
 
