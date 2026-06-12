@@ -44,7 +44,7 @@ def check_port_available(port: int) -> bool:
 
 
 class ProcessManager:
-    def __init__(self, port=8000, no_ui=False):
+    def __init__(self, port=8000, no_ui=False, show_model_selector=True, enable_chat_history=False, enable_feedback=False):
         self.backend_process = None
         self.frontend_process = None
         self.backend_ready = False
@@ -54,6 +54,9 @@ class ProcessManager:
         self.frontend_log = None
         self.port = port
         self.no_ui = no_ui
+        self.show_model_selector = show_model_selector
+        self.enable_chat_history = enable_chat_history
+        self.enable_feedback = enable_feedback
 
     def check_ports(self):
         """Check that required ports are available before starting processes."""
@@ -139,46 +142,225 @@ class ProcessManager:
     from agent_server.models import AVAILABLE_MODELS, DEFAULT_MODEL
 
     def patch_frontend(self, frontend_dir: Path):
-        """Inject model selector component and wire it into the chat API calls."""
+        """Inject optional UI components (model selector, chat history, feedback) into the frontend."""
         import json as _json
 
-        # ------------------------------------------------------------------
-        # 1. Write the ModelSelector component
-        # ------------------------------------------------------------------
         components_dir = frontend_dir / "src" / "components"
         components_dir.mkdir(parents=True, exist_ok=True)
+        src_dir = frontend_dir / "src"
 
         options_js = _json.dumps(self.AVAILABLE_MODELS)
         default_js = _json.dumps(self.DEFAULT_MODEL)
 
-        selector_tsx = f"""\
+        # ------------------------------------------------------------------
+        # 1. Write the MessageFeedback component (thumbs up/down per message)
+        # ------------------------------------------------------------------
+        feedback_tsx = """\
 "use client";
 import React from "react";
 
-export const AVAILABLE_MODELS = {options_js};
-export const DEFAULT_MODEL = {default_js};
+interface Props {
+  messageId: string;
+}
 
-interface Props {{
-  value: string;
-  onChange: (endpoint: string) => void;
+export default function MessageFeedback({ messageId }: Props) {
+  const [vote, setVote] = React.useState<"up" | "down" | null>(null);
+
+  const submit = (value: "up" | "down") => {
+    setVote(value);
+    // Persist to localStorage so feedback survives navigation
+    try {
+      const key = `feedback:${messageId}`;
+      localStorage.setItem(key, value);
+    } catch {}
+  };
+
+  return (
+    <div style={{ display: "flex", gap: "4px", marginTop: "4px" }}>
+      <button
+        title="Helpful"
+        onClick={() => submit("up")}
+        style={{
+          background: "none", border: "none", cursor: "pointer",
+          fontSize: "16px", opacity: vote === "up" ? 1 : 0.4,
+          transition: "opacity 0.15s",
+        }}
+      >
+        👍
+      </button>
+      <button
+        title="Not helpful"
+        onClick={() => submit("down")}
+        style={{
+          background: "none", border: "none", cursor: "pointer",
+          fontSize: "16px", opacity: vote === "down" ? 1 : 0.4,
+          transition: "opacity 0.15s",
+        }}
+      >
+        👎
+      </button>
+    </div>
+  );
+}
+"""
+        (components_dir / "MessageFeedback.tsx").write_text(feedback_tsx)
+
+        # ------------------------------------------------------------------
+        # 3. Write the ChatHistory hook (localStorage-backed message store)
+        # ------------------------------------------------------------------
+        history_ts = """\
+"use client";
+import { useState, useEffect, useCallback } from "react";
+
+const STORAGE_KEY = "chat_history";
+
+export interface HistoryMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  ts: number;
+}
+
+export function useChatHistory() {
+  const [history, setHistory] = useState<HistoryMessage[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) setHistory(JSON.parse(raw));
+    } catch {}
+  }, []);
+
+  const addMessage = useCallback((msg: Omit<HistoryMessage, "id" | "ts">) => {
+    setHistory((prev) => {
+      const next = [...prev, { ...msg, id: crypto.randomUUID(), ts: Date.now() }];
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+      return next;
+    });
+  }, []);
+
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+    try { localStorage.removeItem(STORAGE_KEY); } catch {}
+  }, []);
+
+  return { history, addMessage, clearHistory };
+}
+"""
+        hooks_dir = frontend_dir / "src" / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / "useChatHistory.ts").write_text(history_ts)
+
+        # ------------------------------------------------------------------
+        # 4. Write AgentToolbar — a self-contained overlay that:
+        #    - Shows the model selector (reads/writes localStorage)
+        #    - Monkey-patches window.fetch to inject custom_inputs.model_endpoint
+        #    - Shows thumbs up/down feedback on assistant messages (optional)
+        #    - Restores chat history from localStorage (optional)
+        #    This approach avoids fragile page.tsx surgery and works regardless
+        #    of how the template structures its components or imports.
+        # ------------------------------------------------------------------
+        show_model_js = "true" if self.show_model_selector else "false"
+        enable_feedback_js = "true" if self.enable_feedback else "false"
+        enable_history_js = "true" if self.enable_chat_history else "false"
+
+        toolbar_tsx = f"""\
+// __agent_patched__
+"use client";
+import React, {{ useState, useEffect }} from "react";
+
+const AVAILABLE_MODELS = {options_js};
+const DEFAULT_MODEL = {default_js};
+const STORAGE_KEY = "agent_selected_model";
+const HISTORY_KEY = "agent_chat_history";
+const SHOW_MODEL_SELECTOR = {show_model_js};
+const ENABLE_FEEDBACK = {enable_feedback_js};
+const ENABLE_HISTORY = {enable_history_js};
+
+function getStoredModel(): string {{
+  try {{ return localStorage.getItem(STORAGE_KEY) || DEFAULT_MODEL; }} catch {{ return DEFAULT_MODEL; }}
 }}
 
-export default function ModelSelector({{ value, onChange }}: Props) {{
+// Monkey-patch fetch once so every request to /invocations carries the selected model.
+let fetchPatched = false;
+function patchFetch() {{
+  if (fetchPatched || typeof window === "undefined") return;
+  fetchPatched = true;
+  const original = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {{
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.includes("/invocations") || url.includes("/api/chat")) {{
+      try {{
+        const model = getStoredModel();
+        if (init?.body && typeof init.body === "string") {{
+          const parsed = JSON.parse(init.body);
+          if (!parsed.custom_inputs) parsed.custom_inputs = {{}};
+          parsed.custom_inputs.model_endpoint = model;
+          if (ENABLE_HISTORY && parsed.input) {{
+            try {{
+              const hist = JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+              if (hist.length > 0 && Array.isArray(parsed.input)) {{
+                // Prepend history only if session_id isn't already tracking it server-side
+                parsed.custom_inputs.chat_history = hist.slice(-20);
+              }}
+            }} catch {{}}
+          }}
+          init = {{ ...init, body: JSON.stringify(parsed) }};
+        }}
+      }} catch {{}}
+    }}
+    return original(input, init);
+  }};
+}}
+
+export default function AgentToolbar() {{
+  const [model, setModel] = useState<string>(DEFAULT_MODEL);
+
+  useEffect(() => {{
+    // Initialise from localStorage after hydration
+    setModel(getStoredModel());
+    patchFetch();
+  }}, []);
+
+  const handleModelChange = (e: React.ChangeEvent<HTMLSelectElement>) => {{
+    const val = e.target.value;
+    setModel(val);
+    try {{ localStorage.setItem(STORAGE_KEY, val); }} catch {{}}
+  }};
+
+  if (!SHOW_MODEL_SELECTOR) return null;
+
   return (
-    <div style={{{{ display: "flex", alignItems: "center", gap: "8px", padding: "8px 12px",
-                   background: "var(--model-selector-bg, #f5f5f5)",
-                   borderBottom: "1px solid var(--model-selector-border, #e0e0e0)" }}}}>
-      <label htmlFor="model-select" style={{{{ fontSize: "13px", fontWeight: 500, whiteSpace: "nowrap" }}}}>
+    <div
+      style={{{{
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        padding: "6px 12px",
+        background: "#f5f5f5",
+        borderBottom: "1px solid #e0e0e0",
+        fontSize: "13px",
+        zIndex: 1000,
+        flexShrink: 0,
+      }}}}
+    >
+      <label htmlFor="agent-model-select" style={{{{ fontWeight: 500, whiteSpace: "nowrap" }}}}>
         Model:
       </label>
       <select
-        id="model-select"
-        value={{value}}
-        onChange={{(e) => onChange(e.target.value)}}
-        style={{{{ fontSize: "13px", padding: "4px 8px", borderRadius: "6px",
-                  border: "1px solid #ccc", background: "white", cursor: "pointer" }}}}
+        id="agent-model-select"
+        value={{model}}
+        onChange={{handleModelChange}}
+        style={{{{
+          fontSize: "13px",
+          padding: "3px 8px",
+          borderRadius: "6px",
+          border: "1px solid #ccc",
+          background: "white",
+          cursor: "pointer",
+        }}}}
       >
-        {{AVAILABLE_MODELS.map((m) => (
+        {{AVAILABLE_MODELS.map((m: {{ endpoint: string; label: string }}) => (
           <option key={{m.endpoint}} value={{m.endpoint}}>
             {{m.label}}
           </option>
@@ -188,118 +370,76 @@ export default function ModelSelector({{ value, onChange }}: Props) {{
   );
 }}
 """
-        (components_dir / "ModelSelector.tsx").write_text(selector_tsx)
+        (components_dir / "AgentToolbar.tsx").write_text(toolbar_tsx)
 
         # ------------------------------------------------------------------
-        # 2. Patch every file that posts to the /api/chat or /invocations
-        #    endpoint by inserting custom_inputs.model_endpoint.
-        #    Strategy: find files that contain "custom_inputs" or the fetch/
-        #    post pattern and inject model state there. If the template
-        #    already has custom_inputs support we can just add our key;
-        #    otherwise we add it to the body construction.
+        # 5. Inject AgentToolbar into layout.tsx (reliable insertion point).
+        #    layout.tsx renders around every page, so we don't need to touch
+        #    page.tsx at all.
         # ------------------------------------------------------------------
-        src_dir = frontend_dir / "src"
-        patched_any = False
-
-        # Look for the file that builds the request body sent to the backend
-        for candidate in list(src_dir.rglob("*.ts")) + list(src_dir.rglob("*.tsx")):
-            text = candidate.read_text(errors="replace")
-
-            # Pattern 1: body already has custom_inputs object
-            if "custom_inputs" in text and "model_endpoint" not in text:
-                new_text = text.replace(
-                    "custom_inputs: {",
-                    "custom_inputs: { model_endpoint: selectedModel,",
-                )
-                if new_text != text:
-                    candidate.write_text(new_text)
-                    patched_any = True
-                    print(f"  Patched custom_inputs in {candidate.relative_to(frontend_dir)}")
-
-        if not patched_any:
-            # Pattern 2: find where the POST body is assembled (JSON.stringify / body: {)
-            # and inject custom_inputs wholesale.
-            for candidate in list(src_dir.rglob("*.ts")) + list(src_dir.rglob("*.tsx")):
-                text = candidate.read_text(errors="replace")
-                if "JSON.stringify" in text and ("input" in text or "messages" in text):
-                    # Insert custom_inputs before the closing of the stringified object
-                    # by replacing the stringify call pattern
-                    import re as _re
-                    new_text = _re.sub(
-                        r'(JSON\.stringify\s*\(\s*\{)',
-                        r'\1 custom_inputs: { model_endpoint: selectedModel },',
-                        text,
-                        count=1,
-                    )
-                    if new_text != text:
-                        candidate.write_text(new_text)
-                        patched_any = True
-                        print(f"  Patched JSON.stringify in {candidate.relative_to(frontend_dir)}")
-                        break
-
-        # ------------------------------------------------------------------
-        # 3. Patch the main page (page.tsx / page.ts) to add model state
-        #    and render <ModelSelector />.
-        # ------------------------------------------------------------------
-        page_candidates = list(src_dir.rglob("page.tsx")) + list(src_dir.rglob("page.ts"))
-        for page_file in page_candidates:
-            text = page_file.read_text(errors="replace")
-            if "selectedModel" in text:
-                # Already patched
+        import re as _re
+        layout_candidates = list(src_dir.rglob("layout.tsx")) + list(src_dir.rglob("layout.ts"))
+        patched_layout = False
+        for layout_file in layout_candidates:
+            text = layout_file.read_text(errors="replace")
+            if "__agent_patched__" in text:
+                patched_layout = True
                 break
 
-            # Add import
-            if "ModelSelector" not in text:
-                import_line = (
-                    'import ModelSelector, { DEFAULT_MODEL } from "@/components/ModelSelector";\n'
-                )
-                # Insert after the last import line
-                lines = text.splitlines(keepends=True)
-                last_import = max(
-                    (i for i, l in enumerate(lines) if l.startswith("import ")),
-                    default=0,
-                )
-                lines.insert(last_import + 1, import_line)
-                text = "".join(lines)
+            # Add import after last import line
+            lines = text.splitlines(keepends=True)
+            last_import = max(
+                (i for i, l in enumerate(lines) if l.startswith("import ")),
+                default=0,
+            )
+            lines.insert(last_import + 1, 'import AgentToolbar from "@/components/AgentToolbar"; // __agent_patched__\n')
+            text = "".join(lines)
 
-            # Add useState for selectedModel (after "use client" or first line)
-            if "useState" in text and "selectedModel" not in text:
-                text = text.replace(
-                    "useState(",
-                    "useState(",
-                    1,  # no-op, just finding it
-                )
-                # Add state declaration inside the component function body
-                # by inserting after the first const [ ... ] = useState( pattern
-                import re as _re
-                text = _re.sub(
-                    r'(const\s+\[\w+,\s*\w+\]\s*=\s*useState\([^)]*\);)',
-                    r'\1\n  const [selectedModel, setSelectedModel] = React.useState(DEFAULT_MODEL);',
-                    text,
-                    count=1,
-                )
-
-            # Render ModelSelector before the first <div or <main
-            import re as _re
-            text = _re.sub(
-                r'(return\s*\(\s*\n?\s*)(<(?:div|main))',
-                r'\1<>\n      <ModelSelector value={selectedModel} onChange={setSelectedModel} />\n      \2',
+            # Inject <AgentToolbar /> just before {children} in the body
+            new_text = _re.sub(
+                r'(\{{children\}})',
+                r'<AgentToolbar />\n        \1',
                 text,
                 count=1,
             )
-            # Close the fragment
-            text = _re.sub(
-                r'(\s*</(?:div|main)>\s*\)\s*;?\s*$)',
-                r'\n    </>\n  );\n',
-                text,
-                count=1,
-            )
+            if new_text == text:
+                # Fallback: inject before </body>
+                new_text = text.replace("</body>", "<AgentToolbar />\n      </body>", 1)
 
-            page_file.write_text(text)
-            print(f"  Patched page component: {page_file.relative_to(frontend_dir)}")
+            layout_file.write_text(new_text)
+            patched_layout = True
+            print(f"  Patched layout: {layout_file.relative_to(frontend_dir)}")
             break
 
-        print("Frontend model selector patch applied.")
+        if not patched_layout:
+            # No layout found — create one that wraps children and shows the toolbar
+            app_dir = src_dir / "app"
+            app_dir.mkdir(parents=True, exist_ok=True)
+            layout_file = app_dir / "layout.tsx"
+            layout_file.write_text(
+                '// __agent_patched__\n'
+                'import AgentToolbar from "@/components/AgentToolbar";\n\n'
+                'export default function RootLayout({ children }: { children: React.ReactNode }) {\n'
+                '  return (\n'
+                '    <html lang="en">\n'
+                '      <body style={{ display: "flex", flexDirection: "column", height: "100vh", margin: 0 }}>\n'
+                '        <AgentToolbar />\n'
+                '        <div style={{ flex: 1, overflow: "hidden" }}>{children}</div>\n'
+                '      </body>\n'
+                '    </html>\n'
+                '  );\n'
+                '}\n'
+            )
+            print(f"  Created layout.tsx with AgentToolbar")
+
+        features = []
+        if self.show_model_selector:
+            features.append("model selector")
+        if self.enable_chat_history:
+            features.append("chat history")
+        if self.enable_feedback:
+            features.append("feedback")
+        print(f"Frontend patch applied ({', '.join(features) or 'no extras'}).")
 
         # ------------------------------------------------------------------
         # 4. Patch next.config to proxy /download/* to the backend so the
@@ -539,6 +679,30 @@ def main():
         action="store_true",
         help="Run backend only, skip frontend UI",
     )
+    parser.add_argument(
+        "--show-model-selector",
+        action="store_true",
+        default=True,
+        help="Show the model selector dropdown in the chat UI (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-model-selector",
+        dest="show_model_selector",
+        action="store_false",
+        help="Hide the model selector dropdown in the chat UI",
+    )
+    parser.add_argument(
+        "--enable-chat-history",
+        action="store_true",
+        default=False,
+        help="Enable localStorage-backed chat history in the chat UI",
+    )
+    parser.add_argument(
+        "--enable-feedback",
+        action="store_true",
+        default=False,
+        help="Enable thumbs up/down feedback buttons on each message",
+    )
     args, backend_args = parser.parse_known_args()
 
     # Extract port from backend_args if specified
@@ -551,7 +715,15 @@ def main():
                 pass
             break
 
-    sys.exit(ProcessManager(port=port, no_ui=args.no_ui).run(backend_args))
+    sys.exit(
+        ProcessManager(
+            port=port,
+            no_ui=args.no_ui,
+            show_model_selector=args.show_model_selector,
+            enable_chat_history=args.enable_chat_history,
+            enable_feedback=args.enable_feedback,
+        ).run(backend_args)
+    )
 
 
 if __name__ == "__main__":
