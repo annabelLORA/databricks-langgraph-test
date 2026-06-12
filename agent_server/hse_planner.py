@@ -4,6 +4,7 @@ import io
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import mlflow
 import openpyxl
 
 from agent_server.knowledge import DATA_DIR, HSE_CONTROLS, get_control
@@ -212,6 +213,7 @@ for checklist, cat in SER_CHECKLIST_TO_CATEGORY.items():
 # ── Classification ─────────────────────────────────────────────────────────────
 
 
+@mlflow.trace(span_type="CHAIN")
 def classify_activity(description: str, wbs: str = "") -> list[str]:
     """Return relevant risk categories for an activity, most important first."""
     text = (description + " " + wbs).lower()
@@ -239,6 +241,7 @@ def primary_category(categories: list[str]) -> str:
 # ── Control selection ──────────────────────────────────────────────────────────
 
 
+@mlflow.trace(span_type="CHAIN")
 def controls_for_task(categories: list[str], primary: str, description: str) -> list[dict]:
     """Return the ordered list of controls for a task.
 
@@ -656,6 +659,7 @@ def _classification(category: str) -> str:
 # ── Top 5 assignment ───────────────────────────────────────────────────────────
 
 
+@mlflow.trace(span_type="CHAIN")
 def assign_top5(rows: list[dict]) -> list[dict]:
     """Assign exactly 5 True rows per horizon.
 
@@ -728,6 +732,7 @@ def assign_top5(rows: list[dict]) -> list[dict]:
 # ── Main plan builder ──────────────────────────────────────────────────────────
 
 
+@mlflow.trace(span_type="CHAIN")
 def build_risk_plan(
     activities: list[dict],
     plan_start: datetime,
@@ -799,6 +804,7 @@ COLUMNS = [
 ]
 
 
+@mlflow.trace(span_type="CHAIN")
 def write_excel(
     project_name: str,
     work_pack: str,
