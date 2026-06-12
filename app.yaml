@@ -1,4 +1,4 @@
-command: ["bash", "-c", "cd agent-langgraph && uv run start-app"]
+command: ["uv", "run", "start-app"]
 
 env:
   - name: MLFLOW_TRACKING_URI
